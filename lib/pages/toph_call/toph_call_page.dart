@@ -14,6 +14,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:go_router/go_router.dart';
 import 'package:matrix/matrix.dart';
+import 'package:speech_to_text/speech_to_text.dart' as stt;
 
 class TophCallPage extends StatefulWidget {
   final String roomId;
@@ -32,6 +33,14 @@ class _TophCallPageState extends State<TophCallPage> {
   final TextEditingController _sendController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   bool _isSending = false;
+
+  // Speech-to-text state
+  final _speech = stt.SpeechToText();
+  bool _speechAvailable = false;
+  bool _isListening = false;
+  String _recognizedText = '';
+  String _speechStatusLabel = 'Tap to speak';
+  String? _speechError;
 
   late final FlutterTts _tts;
   bool _isSpeaking = false;
@@ -52,6 +61,8 @@ class _TophCallPageState extends State<TophCallPage> {
     _tts.setErrorHandler((_) {
       if (mounted) setState(() => _isSpeaking = false);
     });
+
+    _initSpeech();
 
     _loadTimeline();
   }
@@ -199,6 +210,154 @@ class _TophCallPageState extends State<TophCallPage> {
     }
   }
 
+  /// Initialize speech recognition and check availability.
+  Future<void> _initSpeech() async {
+    try {
+      _speechAvailable = await _speech.initialize(
+        onStatus: (status) {
+          if (mounted) {
+            setState(() {
+              if (status == stt.SpeechToText.listeningStatus) {
+                _speechStatusLabel = 'Listening...';
+              } else if (status == stt.SpeechToText.notListeningStatus) {
+                if (_isListening) {
+                  _speechStatusLabel = 'Processing...';
+                }
+              } else if (status == stt.SpeechToText.doneStatus) {
+                _speechStatusLabel = 'Tap to speak';
+              }
+            });
+          }
+        },
+        onError: (error) {
+          if (mounted) {
+            setState(() {
+              _speechError = error.errorMsg;
+              _speechStatusLabel = 'Error';
+            });
+          }
+        },
+      );
+    } catch (_) {
+      _speechAvailable = false;
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Start listening for speech and display partial results.
+  Future<void> _startListening() async {
+    if (!_speechAvailable || _isListening) return;
+
+    setState(() {
+      _isListening = true;
+      _recognizedText = '';
+      _speechStatusLabel = 'Listening...';
+      _speechError = null;
+    });
+
+    await _speech.listen(
+      onResult: (result) {
+        if (mounted) {
+          setState(() {
+            _recognizedText = result.recognizedWords;
+            if (result.finalResult) {
+              _speechStatusLabel = 'Processing...';
+            }
+          });
+        }
+      },
+      listenOptions: stt.SpeechListenOptions(
+        listenFor: const Duration(seconds: 60),
+        pauseFor: const Duration(seconds: 5),
+        partialResults: true,
+        cancelOnError: true,
+      ),
+    );
+
+    // After listening finishes (either auto-stop or manual stop),
+    // if we have recognized text and we're still in "listening ended" mode,
+    // send the message.
+    if (mounted && _isListening) {
+      final text = _recognizedText.trim();
+      if (text.isNotEmpty) {
+        await _sendRecognizedText(text);
+      } else {
+        setState(() {
+          _speechStatusLabel = 'No speech detected';
+          _isListening = false;
+        });
+      }
+    }
+  }
+
+  /// Stop listening and send the final recognized text.
+  Future<void> _stopAndSend() async {
+    if (!_isListening) return;
+
+    await _speech.stop();
+
+    if (!mounted) return;
+
+    final text = _recognizedText.trim();
+    if (text.isNotEmpty) {
+      await _sendRecognizedText(text);
+    } else {
+      setState(() {
+        _speechStatusLabel = 'No speech detected';
+        _isListening = false;
+      });
+    }
+  }
+
+  /// Cancel listening without sending.
+  Future<void> _cancelListening() async {
+    await _speech.cancel();
+    if (mounted) {
+      setState(() {
+        _isListening = false;
+        _recognizedText = '';
+        _speechStatusLabel = 'Tap to speak';
+        _speechError = null;
+      });
+    }
+  }
+
+  /// Send recognized text as a Matrix message.
+  Future<void> _sendRecognizedText(String text) async {
+    if (text.isEmpty) return;
+
+    final room = _room;
+    if (room == null) return;
+
+    setState(() {
+      _isSending = true;
+      _isListening = false;
+      _speechStatusLabel = 'Sending...';
+    });
+
+    try {
+      await room.sendTextEvent(text, parseCommands: false);
+      setState(() {
+        _recognizedText = '';
+        _speechStatusLabel = 'Sent ✓';
+      });
+      // Reset status after a brief moment
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (mounted) {
+        setState(() => _speechStatusLabel = 'Tap to speak');
+      }
+    } catch (_) {
+      if (mounted) {
+        setState(() {
+          _speechError = 'Failed to send message';
+          _speechStatusLabel = 'Error';
+        });
+      }
+    } finally {
+      if (mounted) setState(() => _isSending = false);
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     final room = _room;
@@ -246,19 +405,100 @@ class _TophCallPageState extends State<TophCallPage> {
                     ],
                   ),
                 ),
-                // Placeholder mic button
-                IconButton(
-                  iconSize: 48,
-                  onPressed: null, // placeholder — not wired to STT yet
-                  icon: const Icon(Icons.mic),
-                  tooltip: 'Microphone (coming soon)',
-                ),
+                // Mic button — Start/Stop Listening
+                if (_speechAvailable) ...[
+                  if (_isListening)
+                    IconButton(
+                      iconSize: 48,
+                      onPressed: _stopAndSend,
+                      icon: const Icon(Icons.stop_circle, color: Colors.red),
+                      tooltip: 'Stop Listening & Send',
+                    )
+                  else
+                    IconButton(
+                      iconSize: 48,
+                      onPressed: _isSending ? null : _startListening,
+                      icon: Icon(
+                        Icons.mic,
+                        color: Theme.of(context).colorScheme.primary,
+                      ),
+                      tooltip: 'Start Listening',
+                    ),
+                ] else
+                  IconButton(
+                    iconSize: 48,
+                    onPressed: null,
+                    icon: Icon(
+                      Icons.mic_off,
+                      color: Theme.of(context).disabledColor,
+                    ),
+                    tooltip: 'Speech not available',
+                  ),
               ],
             ),
           ),
-          const Text(
-            'Idle',
-            style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+          // Speech status and recognized text
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 2),
+            child: Column(
+              children: [
+                Row(
+                  children: [
+                    if (_isListening)
+                      const Padding(
+                        padding: EdgeInsets.only(right: 8),
+                        child: SizedBox(
+                          width: 16,
+                          height: 16,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        ),
+                      ),
+                    Expanded(
+                      child: Text(
+                        _speechError ?? _speechStatusLabel,
+                        style: TextStyle(
+                          fontSize: 14,
+                          fontWeight: FontWeight.w500,
+                          color: _speechError != null
+                              ? Theme.of(context).colorScheme.error
+                              : _speechStatusLabel == 'Listening...'
+                                  ? Theme.of(context).colorScheme.primary
+                                  : null,
+                        ),
+                      ),
+                    ),
+                    if (_isListening)
+                      TextButton(
+                        onPressed: _cancelListening,
+                        child: const Text('Cancel'),
+                      ),
+                  ],
+                ),
+                if (_recognizedText.isNotEmpty)
+                  Container(
+                    width: double.infinity,
+                    margin: const EdgeInsets.only(top: 4),
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 8,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Theme.of(context)
+                          .colorScheme
+                          .surfaceContainerHighest,
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Text(
+                      _recognizedText,
+                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                            fontStyle: _isListening
+                                ? FontStyle.italic
+                                : FontStyle.normal,
+                          ),
+                    ),
+                  ),
+              ],
+            ),
           ),
           if (_isSpeaking)
             TextButton.icon(
