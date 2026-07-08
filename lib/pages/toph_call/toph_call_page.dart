@@ -6,10 +6,12 @@
 import 'dart:async';
 
 import 'package:fluffychat/l10n/l10n.dart';
+import 'package:fluffychat/pages/toph_call/markdown_speech_sanitizer.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/filtered_timeline_extension.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
 import 'package:fluffychat/widgets/matrix.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_tts/flutter_tts.dart';
 import 'package:go_router/go_router.dart';
 import 'package:matrix/matrix.dart';
 
@@ -24,19 +26,33 @@ class TophCallPage extends StatefulWidget {
 
 class _TophCallPageState extends State<TophCallPage> {
   Timeline? _timeline;
-  // Tracks the most recent event ID when the screen opens, so future
-  // features (e.g., TTS read-aloud) can skip old history.
-  // ignore: unused_field
+  // Tracks the most recent event ID when the screen opens, so TTS
+  // read-aloud can skip old history and only speak new messages.
   String? _latestSeenEventId;
   final TextEditingController _sendController = TextEditingController();
   final ScrollController _scrollController = ScrollController();
   bool _isSending = false;
+
+  late final FlutterTts _tts;
+  bool _isSpeaking = false;
 
   Room? get _room => Matrix.of(context).client.getRoomById(widget.roomId);
 
   @override
   void initState() {
     super.initState();
+    _tts = FlutterTts();
+
+    _tts.setStartHandler(() {
+      if (mounted) setState(() => _isSpeaking = true);
+    });
+    _tts.setCompletionHandler(() {
+      if (mounted) setState(() => _isSpeaking = false);
+    });
+    _tts.setErrorHandler((_) {
+      if (mounted) setState(() => _isSpeaking = false);
+    });
+
     _loadTimeline();
   }
 
@@ -46,6 +62,7 @@ class _TophCallPageState extends State<TophCallPage> {
     _timeline = null;
     _sendController.dispose();
     _scrollController.dispose();
+    _tts.stop();
     super.dispose();
   }
 
@@ -81,7 +98,71 @@ class _TophCallPageState extends State<TophCallPage> {
 
   void _onTimelineUpdate() {
     if (!mounted) return;
+    _speakNewIncoming();
     setState(() {});
+  }
+
+  /// Inspects the timeline for new text events from other senders and speaks
+  /// them aloud via TTS, stopping any current speech first.
+  void _speakNewIncoming() {
+    final timeline = _timeline;
+    if (timeline == null) return;
+
+    final client = Matrix.of(context).client;
+    final ownUserId = client.userID;
+    if (ownUserId == null) return;
+
+    // Collect events from newest to oldest until we hit the last-seen ID.
+    final newEvents = <Event>[];
+    for (final event in timeline.events) {
+      if (event.eventId == _latestSeenEventId) break;
+      newEvents.add(event);
+    }
+
+    // Update the marker to the newest event ID so we don't replay these.
+    if (timeline.events.isNotEmpty) {
+      _latestSeenEventId = timeline.events.first.eventId;
+    }
+
+    if (newEvents.isEmpty) return;
+
+    // Filter to text messages from other senders (not our own).
+    final toSpeak = newEvents
+        .where(
+          (e) =>
+              e.senderId != ownUserId &&
+              e.type == EventTypes.Message &&
+              {
+                MessageTypes.Text,
+                MessageTypes.Emote,
+                MessageTypes.Notice,
+              }.contains(e.messageType),
+        )
+        .toList();
+
+    // Speak in chronological order (oldest first).
+    for (final event in toSpeak.reversed) {
+      final body = event.calcLocalizedBodyFallback(
+        MatrixLocals(L10n.of(context)),
+        withSenderNamePrefix: false,
+        hideReply: true,
+      );
+      final sanitized = sanitizeMarkdownForSpeech(body);
+      if (sanitized.isNotEmpty) {
+        _speak(sanitized);
+      }
+    }
+  }
+
+  /// Stops current speech and speaks [text] via TTS.
+  Future<void> _speak(String text) async {
+    await _tts.stop();
+    await _tts.speak(text);
+  }
+
+  /// Stops any ongoing TTS playback.
+  Future<void> _stopSpeaking() async {
+    await _tts.stop();
   }
 
   List<Event> _visibleTextEvents() {
@@ -179,6 +260,12 @@ class _TophCallPageState extends State<TophCallPage> {
             'Idle',
             style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
           ),
+          if (_isSpeaking)
+            TextButton.icon(
+              onPressed: _stopSpeaking,
+              icon: const Icon(Icons.stop, size: 18),
+              label: const Text('Stop Speaking'),
+            ),
           const Divider(),
 
           // Message list
