@@ -14,7 +14,7 @@ import 'package:matrix/matrix.dart';
 
 import 'matrix.dart';
 
-enum ChatPopupMenuActions { details, encryption, leave, search }
+enum ChatPopupMenuActions { details, encryption, leave, search, tophCall }
 
 class ChatSettingsPopupMenu extends StatefulWidget {
   final Room room;
@@ -82,6 +82,9 @@ class ChatSettingsPopupMenuState extends State<ChatSettingsPopupMenu> {
               case ChatPopupMenuActions.search:
                 context.go('/rooms/${widget.room.id}/search');
                 break;
+              case ChatPopupMenuActions.tophCall:
+                context.go('/rooms/${widget.room.id}/toph-call');
+                break;
               case ChatPopupMenuActions.encryption:
                 context.go('/rooms/${widget.room.id}/encryption');
                 break;
@@ -106,6 +109,16 @@ class ChatSettingsPopupMenuState extends State<ChatSettingsPopupMenu> {
                   const Icon(Icons.search_outlined),
                   const SizedBox(width: 12),
                   Text(L10n.of(context).search),
+                ],
+              ),
+            ),
+            PopupMenuItem<ChatPopupMenuActions>(
+              value: ChatPopupMenuActions.tophCall,
+              child: Row(
+                children: [
+                  const Icon(Icons.record_voice_over_outlined),
+                  const SizedBox(width: 12),
+                  const Text('Toph Call Mode'),
                 ],
               ),
             ),

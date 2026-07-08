@@ -33,6 +33,7 @@ import 'package:fluffychat/pages/settings_password/settings_password.dart';
 import 'package:fluffychat/pages/settings_security/settings_security.dart';
 import 'package:fluffychat/pages/settings_style/settings_style.dart';
 import 'package:fluffychat/pages/sign_in/sign_in_page.dart';
+import 'package:fluffychat/pages/toph_call/toph_call_page.dart';
 import 'package:fluffychat/widgets/config_viewer.dart';
 import 'package:fluffychat/widgets/layouts/empty_page.dart';
 import 'package:fluffychat/widgets/layouts/two_column_layout.dart';
@@ -403,6 +404,15 @@ abstract class AppRoutes {
                     context,
                     state,
                     ChatSearchPage(roomId: state.pathParameters['roomid']!),
+                  ),
+                  redirect: loggedOutRedirect,
+                ),
+                GoRoute(
+                  path: 'toph-call',
+                  pageBuilder: (context, state) => defaultPageBuilder(
+                    context,
+                    state,
+                    TophCallPage(roomId: state.pathParameters['roomid']!),
                   ),
                   redirect: loggedOutRedirect,
                 ),
