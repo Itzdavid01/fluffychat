@@ -40,6 +40,7 @@ class _TophCallPageState extends State<TophCallPage> {
   bool _speechAvailable = false;
   bool _isListening = false;
   bool _speechSendScheduled = false;
+  String? _sentRecognizedText;
   String _recognizedText = '';
   String _speechStatusLabel = 'Tap to speak';
   String? _speechError;
@@ -315,6 +316,7 @@ class _TophCallPageState extends State<TophCallPage> {
     setState(() {
       _isListening = true;
       _speechSendScheduled = false;
+      _sentRecognizedText = null;
       _recognizedText = '';
       _speechStatusLabel = 'Listening...';
       _speechError = null;
@@ -394,6 +396,24 @@ class _TophCallPageState extends State<TophCallPage> {
     }
   }
 
+  /// Manually send the currently recognized text without allowing the final
+  /// speech callback to send the same utterance again.
+  Future<void> _manualSendRecognizedText() async {
+    final text = _recognizedText.trim();
+    if (text.isEmpty || _isSending) return;
+
+    // Reserve this utterance before stopping STT. Some devices emit a final
+    // result during stop(); `_speechSendScheduled` blocks that callback from
+    // scheduling a second Matrix send for the same button press.
+    _speechSendScheduled = true;
+    if (_speech.isListening) {
+      await _speech.stop();
+    }
+
+    if (!mounted) return;
+    await _sendRecognizedText(text);
+  }
+
   /// Cancel listening without sending.
   Future<void> _cancelListening() async {
     await _speech.cancel();
@@ -401,6 +421,7 @@ class _TophCallPageState extends State<TophCallPage> {
       setState(() {
         _isListening = false;
         _speechSendScheduled = false;
+        _sentRecognizedText = null;
         _recognizedText = '';
         _speechStatusLabel = 'Tap to speak';
         _speechError = null;
@@ -410,20 +431,22 @@ class _TophCallPageState extends State<TophCallPage> {
 
   /// Send recognized text as a Matrix message.
   Future<void> _sendRecognizedText(String text) async {
-    if (text.isEmpty) return;
+    final normalizedText = text.trim();
+    if (normalizedText.isEmpty) return;
+    if (_sentRecognizedText == normalizedText) return;
 
     final room = _room;
     if (room == null) return;
 
+    _sentRecognizedText = normalizedText;
     setState(() {
       _isSending = true;
       _isListening = false;
-      _speechSendScheduled = false;
       _speechStatusLabel = 'Sending...';
     });
 
     try {
-      await room.sendTextEvent(text, parseCommands: false);
+      await room.sendTextEvent(normalizedText, parseCommands: false);
       setState(() {
         _recognizedText = '';
         _speechStatusLabel = 'Sent ✓';
@@ -434,6 +457,8 @@ class _TophCallPageState extends State<TophCallPage> {
         setState(() => _speechStatusLabel = 'Tap to speak');
       }
     } catch (_) {
+      _sentRecognizedText = null;
+      _speechSendScheduled = false;
       if (mounted) {
         setState(() {
           _speechError = 'Failed to send message';
@@ -562,8 +587,7 @@ class _TophCallPageState extends State<TophCallPage> {
                         FilledButton.icon(
                           onPressed: _isSending
                               ? null
-                              : () =>
-                                    _sendRecognizedText(_recognizedText.trim()),
+                              : _manualSendRecognizedText,
                           icon: const Icon(Icons.send),
                           label: const Text('Send detected words'),
                         ),
