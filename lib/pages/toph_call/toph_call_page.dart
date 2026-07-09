@@ -7,6 +7,7 @@ import 'dart:async';
 
 import 'package:fluffychat/l10n/l10n.dart';
 import 'package:fluffychat/pages/toph_call/markdown_speech_sanitizer.dart';
+import 'package:fluffychat/pages/toph_call/toph_tts_policy.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/filtered_timeline_extension.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
 import 'package:fluffychat/widgets/matrix.dart';
@@ -46,6 +47,14 @@ class _TophCallPageState extends State<TophCallPage> {
   late final FlutterTts _tts;
   bool _isSpeaking = false;
 
+  // Debounced TTS scheduling state — prevents speaking tool calls,
+  // system/status messages, and intermediate edited messages.
+  final Map<String, Timer> _pendingTtsTimers = {};
+  final Map<String, String> _pendingTtsBodies = {};
+  final Set<String> _spokenTtsKeys = {};
+  final Set<int> _spokenBodyHashes = {};
+  static const _ttsStabilizationDelay = Duration(milliseconds: 1800);
+
   Room? get _room => Matrix.of(context).client.getRoomById(widget.roomId);
 
   @override
@@ -70,6 +79,11 @@ class _TophCallPageState extends State<TophCallPage> {
 
   @override
   void dispose() {
+    for (final timer in _pendingTtsTimers.values) {
+      timer.cancel();
+    }
+    _pendingTtsTimers.clear();
+    _pendingTtsBodies.clear();
     _timeline?.cancelSubscriptions();
     _timeline = null;
     _sendController.dispose();
@@ -114,8 +128,8 @@ class _TophCallPageState extends State<TophCallPage> {
     setState(() {});
   }
 
-  /// Inspects the timeline for new text events from other senders and speaks
-  /// them aloud via TTS, stopping any current speech first.
+  /// Inspects the timeline for new text events from other senders and schedules
+  /// them for TTS read-aloud after filtering and edit stabilization.
   void _speakNewIncoming() {
     final timeline = _timeline;
     if (timeline == null) return;
@@ -139,16 +153,13 @@ class _TophCallPageState extends State<TophCallPage> {
     if (newEvents.isEmpty) return;
 
     // Filter to text messages from other senders (not our own).
+    // Only MessageTypes.Text is speakable — Emote and Notice are excluded.
     final toSpeak = newEvents
         .where(
           (e) =>
               e.senderId != ownUserId &&
               e.type == EventTypes.Message &&
-              {
-                MessageTypes.Text,
-                MessageTypes.Emote,
-                MessageTypes.Notice,
-              }.contains(e.messageType),
+              e.messageType == MessageTypes.Text,
         )
         .toList();
 
@@ -159,11 +170,53 @@ class _TophCallPageState extends State<TophCallPage> {
         withSenderNamePrefix: false,
         hideReply: true,
       );
-      final sanitized = sanitizeMarkdownForSpeech(body);
-      if (sanitized.isNotEmpty) {
-        _speak(sanitized);
-      }
+      _scheduleTtsForEvent(event, body);
     }
+  }
+
+  /// Schedules [event] with [body] for TTS read-aloud after a stabilization
+  /// delay. Cancels any earlier timer for the same event ID. Skips if the
+  /// body is non-speakable, empty after sanitization, or already spoken.
+  void _scheduleTtsForEvent(Event event, String body) {
+    final eventId = event.eventId;
+
+    if (!isSpeakableTophBody(body)) return;
+
+    final sanitized = sanitizeMarkdownForSpeech(body);
+    if (sanitized.isEmpty) return;
+
+    final speakKey = '$eventId:${sanitized.hashCode}';
+    if (_spokenTtsKeys.contains(speakKey)) return;
+
+    _pendingTtsTimers[eventId]?.cancel();
+    _pendingTtsBodies[eventId] = sanitized;
+
+    _pendingTtsTimers[eventId] = Timer(_ttsStabilizationDelay, () {
+      if (!mounted) return;
+
+      final latestSanitized = _pendingTtsBodies.remove(eventId);
+      _pendingTtsTimers.remove(eventId);
+      if (latestSanitized == null || latestSanitized.isEmpty) return;
+
+      final latestKey = '$eventId:${latestSanitized.hashCode}';
+      if (_spokenTtsKeys.contains(latestKey)) return;
+
+      // Body-level duplicate suppression.
+      final bodyHash = latestSanitized.hashCode;
+      if (_spokenBodyHashes.contains(bodyHash)) return;
+
+      // Cap memory growth.
+      if (_spokenTtsKeys.length > 200) {
+        _spokenTtsKeys.clear();
+      }
+      if (_spokenBodyHashes.length > 200) {
+        _spokenBodyHashes.clear();
+      }
+
+      _spokenTtsKeys.add(latestKey);
+      _spokenBodyHashes.add(bodyHash);
+      _speak(latestSanitized);
+    });
   }
 
   /// Stops current speech and speaks [text] via TTS.
