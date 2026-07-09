@@ -280,20 +280,10 @@ class _TophCallPageState extends State<TophCallPage> {
       ),
     );
 
-    // After listening finishes (either auto-stop or manual stop),
-    // if we have recognized text and we're still in "listening ended" mode,
-    // send the message.
-    if (mounted && _isListening) {
-      final text = _recognizedText.trim();
-      if (text.isNotEmpty) {
-        await _sendRecognizedText(text);
-      } else {
-        setState(() {
-          _speechStatusLabel = 'No speech detected';
-          _isListening = false;
-        });
-      }
-    }
+    // Do not send here. `listen()` can complete after the final-result
+    // callback has already scheduled a send, which caused duplicate Matrix
+    // messages. Final results are handled by `_scheduleRecognizedTextSend()`;
+    // manual stop is handled by `_stopAndSend()`.
   }
 
   /// Schedule a send after speech recognition emits a final result.
@@ -325,6 +315,10 @@ class _TophCallPageState extends State<TophCallPage> {
     await _speech.stop();
 
     if (!mounted) return;
+
+    if (_speechSendScheduled) {
+      return;
+    }
 
     final text = _recognizedText.trim();
     if (text.isNotEmpty) {
