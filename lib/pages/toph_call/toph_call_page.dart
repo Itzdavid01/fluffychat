@@ -620,11 +620,11 @@ class _TophCallPageState extends State<TophCallPage> {
                       vertical: 8,
                     ),
                     itemCount: events.length,
-                    // Reverse so newest messages appear at the bottom
+                    // Timeline events are newest-first. With reverse:true,
+                    // item 0 renders at the bottom, matching chat behavior.
                     reverse: true,
                     itemBuilder: (context, index) {
-                      final reversedIndex = events.length - 1 - index;
-                      final event = events[reversedIndex];
+                      final event = events[index];
                       final isOwn =
                           event.senderId == Matrix.of(context).client.userID;
                       final senderName = isOwn
