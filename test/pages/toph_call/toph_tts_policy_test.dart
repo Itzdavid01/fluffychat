@@ -25,28 +25,16 @@ void main() {
     });
 
     test('tool call fragment returns false', () {
-      expect(
-        isSpeakableTophBody('Executing tool call: search_files'),
-        isFalse,
-      );
-      expect(
-        isSpeakableTophBody('Tool call result: found 3 files'),
-        isFalse,
-      );
+      expect(isSpeakableTophBody('Executing tool call: search_files'), isFalse);
+      expect(isSpeakableTophBody('Tool call result: found 3 files'), isFalse);
     });
 
     test('Running as unit: returns false', () {
-      expect(
-        isSpeakableTophBody('Running as unit: search_files'),
-        isFalse,
-      );
+      expect(isSpeakableTophBody('Running as unit: search_files'), isFalse);
     });
 
     test('command output section (=== ... ===) returns false', () {
-      expect(
-        isSpeakableTophBody('=== build ===\nBuild output here'),
-        isFalse,
-      );
+      expect(isSpeakableTophBody('=== build ===\nBuild output here'), isFalse);
     });
 
     test('JSON tool payload returns false', () {
@@ -75,15 +63,40 @@ void main() {
     });
 
     test('memory peak: returns false', () {
+      expect(isSpeakableTophBody('Memory peak: 256MB'), isFalse);
+    });
+
+    test('ad_hoc_verification_ok returns false', () {
+      expect(isSpeakableTophBody('Status: AD_HOC_VERIFICATION_OK'), isFalse);
+    });
+
+    test('edited tool-call chatter returns false', () {
       expect(
-        isSpeakableTophBody('Memory peak: 256MB'),
+        isSpeakableTophBody(
+          'Tool called functions.terminal with parameters {"command": "pwd"}',
+        ),
+        isFalse,
+      );
+      expect(
+        isSpeakableTophBody('recipient_name: functions.read_file'),
+        isFalse,
+      );
+      expect(
+        isSpeakableTophBody('verification_script=/tmp/hermes-verify-abc.py'),
         isFalse,
       );
     });
 
-    test('ad_hoc_verification_ok returns false', () {
+    test('code fences return false', () {
       expect(
-        isSpeakableTophBody('Status: AD_HOC_VERIFICATION_OK'),
+        isSpeakableTophBody('Here is output:\n```dart\nprint("hi");\n```'),
+        isFalse,
+      );
+    });
+
+    test('PASS verification lines return false', () {
+      expect(
+        isSpeakableTophBody('PASS: thing worked\nPASS: cleanup removed'),
         isFalse,
       );
     });

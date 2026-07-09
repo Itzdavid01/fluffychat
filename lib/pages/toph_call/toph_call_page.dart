@@ -171,6 +171,7 @@ class _TophCallPageState extends State<TophCallPage> {
     final toSpeak = newEvents
         .where(
           (e) =>
+              !_isMatrixReplacementEvent(e) &&
               e.senderId != ownUserId &&
               e.type == EventTypes.Message &&
               e.messageType == MessageTypes.Text,
@@ -186,6 +187,11 @@ class _TophCallPageState extends State<TophCallPage> {
       );
       _scheduleTtsForEvent(event, body);
     }
+  }
+
+  bool _isMatrixReplacementEvent(Event event) {
+    final relatesTo = event.content['m.relates_to'];
+    return relatesTo is Map && relatesTo['rel_type'] == RelationshipTypes.edit;
   }
 
   /// Schedules [event] with [body] for TTS read-aloud after a stabilization
