@@ -38,6 +38,7 @@ class _TophCallPageState extends State<TophCallPage> {
   final _speech = stt.SpeechToText();
   bool _speechAvailable = false;
   bool _isListening = false;
+  bool _speechSendScheduled = false;
   String _recognizedText = '';
   String _speechStatusLabel = 'Tap to speak';
   String? _speechError;
@@ -250,6 +251,7 @@ class _TophCallPageState extends State<TophCallPage> {
 
     setState(() {
       _isListening = true;
+      _speechSendScheduled = false;
       _recognizedText = '';
       _speechStatusLabel = 'Listening...';
       _speechError = null;
@@ -264,6 +266,10 @@ class _TophCallPageState extends State<TophCallPage> {
               _speechStatusLabel = 'Processing...';
             }
           });
+
+          if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
+            _scheduleRecognizedTextSend(result.recognizedWords.trim());
+          }
         }
       },
       listenOptions: stt.SpeechListenOptions(
@@ -288,6 +294,28 @@ class _TophCallPageState extends State<TophCallPage> {
         });
       }
     }
+  }
+
+  /// Schedule a send after speech recognition emits a final result.
+  ///
+  /// `SpeechToText.listen()` returns after listening starts, not after speech
+  /// recognition finishes. Without sending from the final-result callback, the
+  /// app can display recognized words but never submit them unless the user
+  /// finds and taps the stop button manually.
+  void _scheduleRecognizedTextSend(String text) {
+    if (_speechSendScheduled || _isSending) return;
+    _speechSendScheduled = true;
+
+    Future<void>.microtask(() async {
+      if (!mounted) return;
+
+      if (_speech.isListening) {
+        await _speech.stop();
+      }
+
+      if (!mounted) return;
+      await _sendRecognizedText(text);
+    });
   }
 
   /// Stop listening and send the final recognized text.
@@ -315,6 +343,7 @@ class _TophCallPageState extends State<TophCallPage> {
     if (mounted) {
       setState(() {
         _isListening = false;
+        _speechSendScheduled = false;
         _recognizedText = '';
         _speechStatusLabel = 'Tap to speak';
         _speechError = null;
@@ -332,6 +361,7 @@ class _TophCallPageState extends State<TophCallPage> {
     setState(() {
       _isSending = true;
       _isListening = false;
+      _speechSendScheduled = false;
       _speechStatusLabel = 'Sending...';
     });
 
@@ -462,8 +492,8 @@ class _TophCallPageState extends State<TophCallPage> {
                           color: _speechError != null
                               ? Theme.of(context).colorScheme.error
                               : _speechStatusLabel == 'Listening...'
-                                  ? Theme.of(context).colorScheme.primary
-                                  : null,
+                              ? Theme.of(context).colorScheme.primary
+                              : null,
                         ),
                       ),
                     ),
@@ -483,18 +513,33 @@ class _TophCallPageState extends State<TophCallPage> {
                       vertical: 8,
                     ),
                     decoration: BoxDecoration(
-                      color: Theme.of(context)
-                          .colorScheme
-                          .surfaceContainerHighest,
+                      color: Theme.of(
+                        context,
+                      ).colorScheme.surfaceContainerHighest,
                       borderRadius: BorderRadius.circular(8),
                     ),
-                    child: Text(
-                      _recognizedText,
-                      style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            fontStyle: _isListening
-                                ? FontStyle.italic
-                                : FontStyle.normal,
-                          ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          _recognizedText,
+                          style: Theme.of(context).textTheme.bodyMedium
+                              ?.copyWith(
+                                fontStyle: _isListening
+                                    ? FontStyle.italic
+                                    : FontStyle.normal,
+                              ),
+                        ),
+                        const SizedBox(height: 8),
+                        FilledButton.icon(
+                          onPressed: _isSending
+                              ? null
+                              : () =>
+                                    _sendRecognizedText(_recognizedText.trim()),
+                          icon: const Icon(Icons.send),
+                          label: const Text('Send detected words'),
+                        ),
+                      ],
                     ),
                   ),
               ],
@@ -515,11 +560,10 @@ class _TophCallPageState extends State<TophCallPage> {
                     child: Text(
                       'No messages yet. Send a text to start.',
                       style: Theme.of(context).textTheme.bodyMedium?.copyWith(
-                            color: Theme.of(context)
-                                .colorScheme
-                                .onSurface
-                                .withAlpha(128),
-                          ),
+                        color: Theme.of(
+                          context,
+                        ).colorScheme.onSurface.withAlpha(128),
+                      ),
                     ),
                   )
                 : ListView.builder(
@@ -538,8 +582,7 @@ class _TophCallPageState extends State<TophCallPage> {
                           event.senderId == Matrix.of(context).client.userID;
                       final senderName = isOwn
                           ? L10n.of(context).you
-                          : event.senderFromMemoryOrFallback
-                              .calcDisplayname();
+                          : event.senderFromMemoryOrFallback.calcDisplayname();
                       final body = event.calcLocalizedBodyFallback(
                         matrixLocals,
                         withSenderNamePrefix: false,
@@ -563,29 +606,27 @@ class _TophCallPageState extends State<TophCallPage> {
                             ),
                             decoration: BoxDecoration(
                               color: isOwn
-                                  ? Theme.of(context)
-                                      .colorScheme
-                                      .primaryContainer
-                                  : Theme.of(context)
-                                      .colorScheme
-                                      .surfaceContainerHighest,
+                                  ? Theme.of(
+                                      context,
+                                    ).colorScheme.primaryContainer
+                                  : Theme.of(
+                                      context,
+                                    ).colorScheme.surfaceContainerHighest,
                               borderRadius: BorderRadius.circular(12),
                             ),
                             child: Column(
-                              crossAxisAlignment:
-                                  isOwn ? CrossAxisAlignment.end
-                                      : CrossAxisAlignment.start,
+                              crossAxisAlignment: isOwn
+                                  ? CrossAxisAlignment.end
+                                  : CrossAxisAlignment.start,
                               children: [
                                 Text(
                                   senderName,
-                                  style: Theme.of(context)
-                                      .textTheme
-                                      .labelSmall
+                                  style: Theme.of(context).textTheme.labelSmall
                                       ?.copyWith(
                                         fontWeight: FontWeight.bold,
-                                        color: Theme.of(context)
-                                            .colorScheme
-                                            .primary,
+                                        color: Theme.of(
+                                          context,
+                                        ).colorScheme.primary,
                                       ),
                                 ),
                                 const SizedBox(height: 2),
