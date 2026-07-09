@@ -114,7 +114,12 @@ class _TophCallPageState extends State<TophCallPage> {
       );
     }
 
-    // Record the latest event ID as seen so we can track new messages later
+    // Request missing room keys for encrypted history, matching normal chat.
+    // Without this, undecryptable events remain EventTypes.Encrypted and are
+    // filtered out of the Toph Call text history.
+    _timeline?.requestKeys(onlineKeyBackupOnly: false);
+
+    // Record the latest event ID as seen so we can track new messages later.
     if (_timeline != null && _timeline!.events.isNotEmpty) {
       _latestSeenEventId = _timeline!.events.first.eventId;
     }
@@ -124,7 +129,12 @@ class _TophCallPageState extends State<TophCallPage> {
 
   void _onTimelineUpdate() {
     if (!mounted) return;
-    _speakNewIncoming();
+    try {
+      _speakNewIncoming();
+    } catch (_) {
+      // Timeline updates must still rebuild the message list even if TTS
+      // filtering/scheduling hits an unexpected event shape.
+    }
     setState(() {});
   }
 
