@@ -70,7 +70,7 @@ android {
     }
 
     defaultConfig {
-        applicationId = "chat.fluffy.fluffychat"
+        applicationId = "chat.fluffy.tophcall"
         minSdk = flutter.minSdkVersion
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
