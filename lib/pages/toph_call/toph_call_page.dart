@@ -492,35 +492,6 @@ class _TophCallPageState extends State<TophCallPage> {
                     ],
                   ),
                 ),
-                // Mic button — Start/Stop Listening
-                if (_speechAvailable) ...[
-                  if (_isListening)
-                    IconButton(
-                      iconSize: 48,
-                      onPressed: _stopAndSend,
-                      icon: const Icon(Icons.stop_circle, color: Colors.red),
-                      tooltip: 'Stop Listening & Send',
-                    )
-                  else
-                    IconButton(
-                      iconSize: 48,
-                      onPressed: _isSending ? null : _startListening,
-                      icon: Icon(
-                        Icons.mic,
-                        color: Theme.of(context).colorScheme.primary,
-                      ),
-                      tooltip: 'Start Listening',
-                    ),
-                ] else
-                  IconButton(
-                    iconSize: 48,
-                    onPressed: null,
-                    icon: Icon(
-                      Icons.mic_off,
-                      color: Theme.of(context).disabledColor,
-                    ),
-                    tooltip: 'Speech not available',
-                  ),
               ],
             ),
           ),
@@ -702,8 +673,61 @@ class _TophCallPageState extends State<TophCallPage> {
 
           const Divider(height: 1),
 
+          // Large bottom mic control for car-friendly hands-free use.
+          SafeArea(
+            top: false,
+            bottom: false,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(12, 10, 12, 8),
+              child: SizedBox(
+                width: double.infinity,
+                height: 72,
+                child: FilledButton.icon(
+                  onPressed: !_speechAvailable
+                      ? null
+                      : _isListening
+                      ? _stopAndSend
+                      : _isSending
+                      ? null
+                      : _startListening,
+                  icon: Icon(
+                    !_speechAvailable
+                        ? Icons.mic_off
+                        : _isListening
+                        ? Icons.stop_circle
+                        : Icons.mic,
+                    size: 34,
+                  ),
+                  label: Text(
+                    !_speechAvailable
+                        ? 'Speech unavailable'
+                        : _isListening
+                        ? 'Stop & Send'
+                        : 'Tap to Speak',
+                    style: Theme.of(context).textTheme.titleLarge?.copyWith(
+                      color: Theme.of(context).colorScheme.onPrimary,
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                  style: FilledButton.styleFrom(
+                    backgroundColor: _isListening
+                        ? Theme.of(context).colorScheme.error
+                        : null,
+                    foregroundColor: _isListening
+                        ? Theme.of(context).colorScheme.onError
+                        : null,
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+
           // Text input and send row
           SafeArea(
+            top: false,
             child: Padding(
               padding: const EdgeInsets.fromLTRB(8, 4, 4, 8),
               child: Row(
