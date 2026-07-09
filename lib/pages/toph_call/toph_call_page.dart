@@ -250,6 +250,17 @@ class _TophCallPageState extends State<TophCallPage> {
     await _tts.stop();
   }
 
+  /// Replays a visible chat bubble through the same TTS safety policy used for
+  /// incoming messages. Tool/status/system chatter stays silent even if tapped.
+  Future<void> _replayMessage(String body) async {
+    if (!isSpeakableTophBody(body)) return;
+
+    final sanitized = sanitizeMarkdownForSpeech(body);
+    if (sanitized.isEmpty) return;
+
+    await _speak(sanitized);
+  }
+
   List<Event> _visibleTextEvents() {
     final timeline = _timeline;
     if (timeline == null) return [];
@@ -685,46 +696,57 @@ class _TophCallPageState extends State<TophCallPage> {
                           alignment: isOwn
                               ? Alignment.centerRight
                               : Alignment.centerLeft,
-                          child: Container(
-                            constraints: BoxConstraints(
-                              maxWidth:
-                                  MediaQuery.of(context).size.width * 0.78,
-                            ),
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 12,
-                              vertical: 8,
-                            ),
-                            decoration: BoxDecoration(
-                              color: isOwn
-                                  ? Theme.of(
-                                      context,
-                                    ).colorScheme.primaryContainer
-                                  : Theme.of(
-                                      context,
-                                    ).colorScheme.surfaceContainerHighest,
+                          child: Material(
+                            color: Colors.transparent,
+                            child: InkWell(
                               borderRadius: BorderRadius.circular(12),
-                            ),
-                            child: Column(
-                              crossAxisAlignment: isOwn
-                                  ? CrossAxisAlignment.end
-                                  : CrossAxisAlignment.start,
-                              children: [
-                                Text(
-                                  senderName,
-                                  style: Theme.of(context).textTheme.labelSmall
-                                      ?.copyWith(
-                                        fontWeight: FontWeight.bold,
-                                        color: Theme.of(
+                              onTap: () => unawaited(_replayMessage(body)),
+                              child: Container(
+                                constraints: BoxConstraints(
+                                  maxWidth:
+                                      MediaQuery.of(context).size.width * 0.78,
+                                ),
+                                padding: const EdgeInsets.symmetric(
+                                  horizontal: 12,
+                                  vertical: 8,
+                                ),
+                                decoration: BoxDecoration(
+                                  color: isOwn
+                                      ? Theme.of(
                                           context,
-                                        ).colorScheme.primary,
-                                      ),
+                                        ).colorScheme.primaryContainer
+                                      : Theme.of(
+                                          context,
+                                        ).colorScheme.surfaceContainerHighest,
+                                  borderRadius: BorderRadius.circular(12),
                                 ),
-                                const SizedBox(height: 2),
-                                SelectableText(
-                                  body,
-                                  style: Theme.of(context).textTheme.bodyMedium,
+                                child: Column(
+                                  crossAxisAlignment: isOwn
+                                      ? CrossAxisAlignment.end
+                                      : CrossAxisAlignment.start,
+                                  children: [
+                                    Text(
+                                      senderName,
+                                      style: Theme.of(context)
+                                          .textTheme
+                                          .labelSmall
+                                          ?.copyWith(
+                                            fontWeight: FontWeight.bold,
+                                            color: Theme.of(
+                                              context,
+                                            ).colorScheme.primary,
+                                          ),
+                                    ),
+                                    const SizedBox(height: 2),
+                                    Text(
+                                      body,
+                                      style: Theme.of(
+                                        context,
+                                      ).textTheme.bodyMedium,
+                                    ),
+                                  ],
                                 ),
-                              ],
+                              ),
                             ),
                           ),
                         ),
