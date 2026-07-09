@@ -40,6 +40,7 @@ class _TophCallPageState extends State<TophCallPage> {
   bool _speechAvailable = false;
   bool _isListening = false;
   bool _speechSendScheduled = false;
+  Timer? _pendingSpeechSendTimer;
   String? _sentRecognizedText;
   String _recognizedText = '';
   String _speechStatusLabel = 'Tap to speak';
@@ -85,6 +86,8 @@ class _TophCallPageState extends State<TophCallPage> {
     }
     _pendingTtsTimers.clear();
     _pendingTtsBodies.clear();
+    _pendingSpeechSendTimer?.cancel();
+    _pendingSpeechSendTimer = null;
     _timeline?.cancelSubscriptions();
     _timeline = null;
     _sendController.dispose();
@@ -316,6 +319,8 @@ class _TophCallPageState extends State<TophCallPage> {
     setState(() {
       _isListening = true;
       _speechSendScheduled = false;
+      _pendingSpeechSendTimer?.cancel();
+      _pendingSpeechSendTimer = null;
       _sentRecognizedText = null;
       _recognizedText = '';
       _speechStatusLabel = 'Listening...';
@@ -361,16 +366,26 @@ class _TophCallPageState extends State<TophCallPage> {
     if (_speechSendScheduled || _isSending) return;
     _speechSendScheduled = true;
 
-    Future<void>.microtask(() async {
-      if (!mounted) return;
-
-      if (_speech.isListening) {
-        await _speech.stop();
-      }
-
-      if (!mounted) return;
-      await _sendRecognizedText(text);
+    // Give an explicit manual tap a chance to win. Android STT often emits a
+    // final result at the same moment the user presses the visible send button;
+    // deferring the automatic send lets the manual path cancel this timer so
+    // one utterance cannot go out through both paths.
+    _pendingSpeechSendTimer?.cancel();
+    _pendingSpeechSendTimer = Timer(const Duration(milliseconds: 700), () {
+      _pendingSpeechSendTimer = null;
+      unawaited(_sendScheduledRecognizedText(text));
     });
+  }
+
+  Future<void> _sendScheduledRecognizedText(String text) async {
+    if (!mounted || _isSending) return;
+
+    if (_speech.isListening) {
+      await _speech.stop();
+    }
+
+    if (!mounted) return;
+    await _sendRecognizedText(text);
   }
 
   /// Stop listening and send the final recognized text.
@@ -402,16 +417,26 @@ class _TophCallPageState extends State<TophCallPage> {
     final text = _recognizedText.trim();
     if (text.isEmpty || _isSending) return;
 
+    // Manual send wins over any delayed automatic final-result send.
+    _pendingSpeechSendTimer?.cancel();
+    _pendingSpeechSendTimer = null;
+
     // Reserve this utterance before stopping STT. Some devices emit a final
     // result during stop(); `_speechSendScheduled` blocks that callback from
     // scheduling a second Matrix send for the same button press.
     _speechSendScheduled = true;
+    setState(() {
+      _isSending = true;
+      _isListening = false;
+      _speechStatusLabel = 'Sending...';
+    });
+
     if (_speech.isListening) {
       await _speech.stop();
     }
 
     if (!mounted) return;
-    await _sendRecognizedText(text);
+    await _sendRecognizedText(text, sendingAlreadyShown: true);
   }
 
   /// Cancel listening without sending.
@@ -421,6 +446,8 @@ class _TophCallPageState extends State<TophCallPage> {
       setState(() {
         _isListening = false;
         _speechSendScheduled = false;
+        _pendingSpeechSendTimer?.cancel();
+        _pendingSpeechSendTimer = null;
         _sentRecognizedText = null;
         _recognizedText = '';
         _speechStatusLabel = 'Tap to speak';
@@ -430,7 +457,10 @@ class _TophCallPageState extends State<TophCallPage> {
   }
 
   /// Send recognized text as a Matrix message.
-  Future<void> _sendRecognizedText(String text) async {
+  Future<void> _sendRecognizedText(
+    String text, {
+    bool sendingAlreadyShown = false,
+  }) async {
     final normalizedText = text.trim();
     if (normalizedText.isEmpty) return;
     if (_sentRecognizedText == normalizedText) return;
@@ -439,11 +469,13 @@ class _TophCallPageState extends State<TophCallPage> {
     if (room == null) return;
 
     _sentRecognizedText = normalizedText;
-    setState(() {
-      _isSending = true;
-      _isListening = false;
-      _speechStatusLabel = 'Sending...';
-    });
+    if (!sendingAlreadyShown) {
+      setState(() {
+        _isSending = true;
+        _isListening = false;
+        _speechStatusLabel = 'Sending...';
+      });
+    }
 
     try {
       await room.sendTextEvent(normalizedText, parseCommands: false);
