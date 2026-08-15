@@ -5,6 +5,7 @@
 
 import 'dart:async';
 
+import 'package:audio_session/audio_session.dart';
 import 'package:fluffychat/l10n/l10n.dart';
 import 'package:fluffychat/pages/toph_call/markdown_speech_sanitizer.dart';
 import 'package:fluffychat/pages/toph_call/toph_tts_policy.dart';
@@ -71,6 +72,11 @@ class _TophCallPageState extends State<TophCallPage> {
   late final FlutterTts _tts;
   bool _isSpeaking = false;
 
+  // Audio focus / session management.
+  AudioSession? _session;
+  StreamSubscription<AudioInterruptionEvent>? _interruptionSubscription;
+  StreamSubscription<AudioDevicesChangedEvent>? _devicesChangedSubscription;
+
   // Debounced TTS scheduling state — prevents speaking tool calls,
   // system/status messages, and intermediate edited messages.
   final Map<String, Timer> _pendingTtsTimers = {};
@@ -111,6 +117,8 @@ class _TophCallPageState extends State<TophCallPage> {
 
     _initSpeech();
 
+    _configureAudioSession();
+
     _loadTimeline();
   }
 
@@ -125,12 +133,83 @@ class _TophCallPageState extends State<TophCallPage> {
     _ttsQueuePlaying = false;
     _pendingSpeechSendTimer?.cancel();
     _pendingSpeechSendTimer = null;
+    _interruptionSubscription?.cancel();
+    _interruptionSubscription = null;
+    _devicesChangedSubscription?.cancel();
+    _devicesChangedSubscription = null;
+    unawaited(_session?.setActive(false));
     _timeline?.cancelSubscriptions();
     _timeline = null;
     _sendController.dispose();
     _scrollController.dispose();
     _tts.stop();
     super.dispose();
+  }
+
+  /// Configures [AudioSession] for hands-free voice use, requests audio focus,
+  /// and subscribes to interruption / device-change events.
+  Future<void> _configureAudioSession() async {
+    try {
+      final session = await AudioSession.instance;
+      _session = session;
+
+      await session.configure(
+        const AudioSessionConfiguration(
+          avAudioSessionCategory: AVAudioSessionCategory.playAndRecord,
+          avAudioSessionCategoryOptions:
+              AVAudioSessionCategoryOptions(0x2c), // defaultToSpeaker | allowBluetooth | allowBluetoothA2dp
+          androidAudioAttributes: AndroidAudioAttributes(
+            contentType: AndroidAudioContentType.speech,
+            usage: AndroidAudioUsage.voiceCommunication,
+          ),
+          androidWillPauseWhenDucked: false,
+        ),
+      );
+
+      // Request audio focus so TTS ducks other media instead of mixing.
+      unawaited(session.setActive(true));
+
+      // Handle audio interruptions (e.g. incoming phone call).
+      _interruptionSubscription =
+          session.interruptionEventStream.listen((event) {
+        try {
+          if (!mounted) return;
+          if (event.begin) {
+            // An interruption started — stop TTS and STT.
+            unawaited(_stopSpeaking());
+            if (_isListening) {
+              unawaited(_speech.cancel());
+              if (mounted) {
+                setState(() {
+                  _isListening = false;
+                  _speechStatusLabel = 'Tap to speak';
+                });
+              }
+            }
+          }
+          // When the interruption ends (.begin == false), do NOT auto-resume;
+          // the user can tap to talk again.
+        } catch (e, st) {
+          debugPrint('Toph Call audio interruption handler error: $e\n$st');
+        }
+      });
+
+      // Handle device changes (e.g. headset unplugged) — stop TTS to avoid
+      // audio routing surprises.
+      _devicesChangedSubscription =
+          session.devicesChangedEventStream.listen((event) {
+        try {
+          if (!mounted) return;
+          if (event.devicesRemoved.isNotEmpty) {
+            unawaited(_stopSpeaking());
+          }
+        } catch (e, st) {
+          debugPrint('Toph Call audio device change handler error: $e\n$st');
+        }
+      });
+    } catch (e, st) {
+      debugPrint('Toph Call audio session configuration failed: $e\n$st');
+    }
   }
 
   Future<void> _loadTimeline() async {
