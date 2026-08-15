@@ -17,6 +17,28 @@ import 'package:go_router/go_router.dart';
 import 'package:matrix/matrix.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
 
+/// Returns `true` when Toph should immediately stop speaking because the user
+/// has started talking (barge-in).
+///
+/// Barge-in is triggered when Toph is currently speaking AND the speech
+/// recogniser signals that the user is actively talking — either because the
+/// platform emitted a `listening` status, or because a non-empty partial
+/// recognition result arrived while the status event had not yet fired.
+///
+/// Parameters:
+/// - [isSpeaking]       – `_isSpeaking` flag (TTS engine is playing).
+/// - [isListening]      – `true` when the STT status callback reported
+///                        `SpeechToText.listeningStatus`.
+/// - [hasPartialSpeech] – `true` when a non-final STT result contains
+///                        non-empty `recognizedWords`.
+bool shouldBargeIn({
+  required bool isSpeaking,
+  required bool isListening,
+  required bool hasPartialSpeech,
+}) {
+  return isSpeaking && (isListening || hasPartialSpeech);
+}
+
 class TophCallPage extends StatefulWidget {
   final String roomId;
 
@@ -455,6 +477,16 @@ class _TophCallPageState extends State<TophCallPage> {
     try {
       _speechAvailable = await _speech.initialize(
         onStatus: (status) {
+          // Barge-in: the instant the microphone transitions to active
+          // listening while Toph is speaking, stop TTS fire-and-forget.
+          if (shouldBargeIn(
+            isSpeaking: _isSpeaking,
+            isListening: status == stt.SpeechToText.listeningStatus,
+            hasPartialSpeech: false,
+          )) {
+            unawaited(_stopSpeaking());
+          }
+
           if (mounted) {
             setState(() {
               if (status == stt.SpeechToText.listeningStatus) {
@@ -508,6 +540,20 @@ class _TophCallPageState extends State<TophCallPage> {
       await _speech.listen(
         onResult: (result) {
           if (mounted) {
+            // Barge-in guard: if a non-final partial result with words arrives
+            // while Toph is still speaking, stop TTS immediately so the user
+            // is not talked over.  Empty or final-only results (no active
+            // voice) do not trigger barge-in.
+            if (shouldBargeIn(
+              isSpeaking: _isSpeaking,
+              isListening: false,
+              hasPartialSpeech:
+                  !result.finalResult &&
+                  result.recognizedWords.trim().isNotEmpty,
+            )) {
+              unawaited(_stopSpeaking());
+            }
+
             setState(() {
               _recognizedText = result.recognizedWords;
               if (result.finalResult) {
