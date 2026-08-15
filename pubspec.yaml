@@ -16,8 +16,8 @@ environment:
 
 dependencies:
   archive: ^4.0.7
-  audio_session: ^0.2.4
   async: ^2.13.1
+  audio_session: ^0.2.4
   badges: ^3.2.0
   blurhash_dart: ^1.2.1
   chewie: ^1.14.1
