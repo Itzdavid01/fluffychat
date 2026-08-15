@@ -8,6 +8,7 @@ import 'dart:async';
 import 'package:audio_session/audio_session.dart';
 import 'package:fluffychat/l10n/l10n.dart';
 import 'package:fluffychat/pages/toph_call/markdown_speech_sanitizer.dart';
+import 'package:fluffychat/pages/toph_call/toph_endpointing.dart';
 import 'package:fluffychat/pages/toph_call/toph_tts_policy.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/filtered_timeline_extension.dart';
 import 'package:fluffychat/utils/matrix_sdk_extensions/matrix_locals.dart';
@@ -62,7 +63,10 @@ class _TophCallPageState extends State<TophCallPage> {
   final _speech = stt.SpeechToText();
   bool _speechAvailable = false;
   bool _isListening = false;
-  bool _speechSendScheduled = false;
+  // Active endpointer for the current STT session; null between sessions.
+  AdaptiveEndpointer? _endpointer;
+  // Safety-net timer — kept so dispose() can cancel it on widget teardown.
+  // The endpointer owns the real confirm timer; this mirrors kMaxTurnDuration.
   Timer? _pendingSpeechSendTimer;
   String? _sentRecognizedText;
   String _recognizedText = '';
@@ -133,6 +137,8 @@ class _TophCallPageState extends State<TophCallPage> {
     _ttsQueuePlaying = false;
     _pendingSpeechSendTimer?.cancel();
     _pendingSpeechSendTimer = null;
+    _endpointer?.cancel();
+    _endpointer = null;
     _interruptionSubscription?.cancel();
     _interruptionSubscription = null;
     _devicesChangedSubscription?.cancel();
@@ -566,6 +572,10 @@ class _TophCallPageState extends State<TophCallPage> {
             unawaited(_stopSpeaking());
           }
 
+          // Adaptive endpointing: every status transition counts as activity
+          // so an ongoing recognition session keeps extending the deadline.
+          _endpointer?.onActivity();
+
           if (mounted) {
             setState(() {
               if (status == stt.SpeechToText.listeningStatus) {
@@ -581,13 +591,14 @@ class _TophCallPageState extends State<TophCallPage> {
           }
         },
         onError: (error) {
+          _endpointer?.cancel();
+          _endpointer = null;
           if (mounted) {
             setState(() {
               _speechError = error.errorMsg;
               _speechStatusLabel = 'Error';
               // Reset listening state on error so the mic button recovers.
               _isListening = false;
-              _speechSendScheduled = false;
               _pendingSpeechSendTimer?.cancel();
               _pendingSpeechSendTimer = null;
             });
@@ -604,9 +615,12 @@ class _TophCallPageState extends State<TophCallPage> {
   Future<void> _startListening() async {
     if (!_speechAvailable || _isListening) return;
 
+    // Cancel any leftover endpointer from a previous session.
+    _endpointer?.cancel();
+    _endpointer = null;
+
     setState(() {
       _isListening = true;
-      _speechSendScheduled = false;
       _pendingSpeechSendTimer?.cancel();
       _pendingSpeechSendTimer = null;
       _sentRecognizedText = null;
@@ -614,6 +628,13 @@ class _TophCallPageState extends State<TophCallPage> {
       _speechStatusLabel = 'Listening...';
       _speechError = null;
     });
+
+    // Create an endpointer for this session. Its onSend callback fires on the
+    // Dart microtask/timer thread — use _sendScheduledRecognizedText which is
+    // already safe to call from a Timer context.
+    _endpointer = AdaptiveEndpointer(
+      onSend: (text) => unawaited(_sendScheduledRecognizedText(text)),
+    );
 
     try {
       await _speech.listen(
@@ -640,8 +661,16 @@ class _TophCallPageState extends State<TophCallPage> {
               }
             });
 
-            if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
-              _scheduleRecognizedTextSend(result.recognizedWords.trim());
+            if (result.finalResult &&
+                result.recognizedWords.trim().isNotEmpty) {
+              // Adaptive endpointing: hand the final text to the endpointer.
+              // It will call onSend after silence is detected or the safety-net
+              // timer fires, whichever comes first.
+              _endpointer?.onFinalResult(result.recognizedWords.trim());
+            } else if (!result.finalResult &&
+                result.recognizedWords.trim().isNotEmpty) {
+              // Partial result — extend the silence deadline.
+              _endpointer?.onActivity();
             }
           }
         },
@@ -675,31 +704,11 @@ class _TophCallPageState extends State<TophCallPage> {
     }
   }
 
-  /// Schedule a send after speech recognition emits a final result.
+  /// Shared send handler invoked by [AdaptiveEndpointer.onSend] (adaptive
+  /// silence endpointing) and by the explicit "Stop & Send" path.
   ///
-  /// `SpeechToText.listen()` returns after listening starts, not after speech
-  /// recognition finishes. Without sending from the final-result callback, the
-  /// app can display recognized words but never submit them unless the user
-  /// finds and taps the stop button manually.
-  void _scheduleRecognizedTextSend(String text) {
-    // Always restart the timer with the latest recognized text so that
-    // repeated final results (e.g. long natural pauses between phrases)
-    // don't leave a stale first result scheduled. Only bail out when a
-    // send is already in-flight.
-    if (_isSending) return;
-    _speechSendScheduled = true;
-
-    // Give natural pauses room before auto-sending. Android STT can emit a
-    // final result while the user is still thinking; a short delay made Toph
-    // Call send before David finished talking. Keep this aligned with the
-    // 5-second pauseFor window so auto-send only fires after a real pause.
-    _pendingSpeechSendTimer?.cancel();
-    _pendingSpeechSendTimer = Timer(const Duration(seconds: 5), () {
-      _pendingSpeechSendTimer = null;
-      unawaited(_sendScheduledRecognizedText(text));
-    });
-  }
-
+  /// Stops the STT engine if still running, then delegates to
+  /// [_sendRecognizedText] which owns the idempotency guard and Matrix send.
   Future<void> _sendScheduledRecognizedText(String text) async {
     if (!mounted || _isSending) return;
 
@@ -709,23 +718,21 @@ class _TophCallPageState extends State<TophCallPage> {
 
     if (!mounted) return;
     await _sendRecognizedText(text);
-    // Timer fired and send completed — clear the flag so future
-    // listen sessions don't start with a stale pending state.
-    _speechSendScheduled = false;
+    // Send completed — clear the flag so future listen sessions don't start
+    // with a stale pending state.
   }
 
   /// Stop listening and send the final recognized text.
   Future<void> _stopAndSend() async {
     if (!_isListening) return;
 
-    // Explicit Stop & Send wins over the delayed automatic final-result send.
-    // Returning early here can lose speech if the delayed timer later fails or
-    // the room becomes unavailable.
-    if (_speechSendScheduled) {
-      _pendingSpeechSendTimer?.cancel();
-      _pendingSpeechSendTimer = null;
-      _speechSendScheduled = false;
-    }
+    // Explicit Stop & Send wins over the adaptive endpointer.
+    // Cancel the endpointer so its timer cannot fire concurrently with our
+    // manual send.
+    _endpointer?.cancel();
+    _endpointer = null;
+    _pendingSpeechSendTimer?.cancel();
+    _pendingSpeechSendTimer = null;
 
     await _speech.stop();
 
@@ -748,14 +755,15 @@ class _TophCallPageState extends State<TophCallPage> {
     final text = _recognizedText.trim();
     if (text.isEmpty || _isSending) return;
 
-    // Manual send wins over any delayed automatic final-result send.
+    // Manual send wins over any adaptive endpointing or pending timer.
+    _endpointer?.cancel();
+    _endpointer = null;
     _pendingSpeechSendTimer?.cancel();
     _pendingSpeechSendTimer = null;
 
-    // Reserve this utterance before stopping STT. Some devices emit a final
-    // result during stop(); `_speechSendScheduled` blocks that callback from
-    // scheduling a second Matrix send for the same button press.
-    _speechSendScheduled = true;
+    // The endpointer is already cancelled above. Set _isSending=true before
+    // stopping STT so that any final-result callback emitted during stop()
+    // finds _isSending true and returns early without scheduling a send.
     setState(() {
       _isSending = true;
       _isListening = false;
@@ -772,11 +780,12 @@ class _TophCallPageState extends State<TophCallPage> {
 
   /// Cancel listening without sending.
   Future<void> _cancelListening() async {
+    _endpointer?.cancel();
+    _endpointer = null;
     await _speech.cancel();
     if (mounted) {
       setState(() {
         _isListening = false;
-        _speechSendScheduled = false;
         _pendingSpeechSendTimer?.cancel();
         _pendingSpeechSendTimer = null;
         _sentRecognizedText = null;
@@ -798,7 +807,6 @@ class _TophCallPageState extends State<TophCallPage> {
 
     final room = _room;
     if (room == null) {
-      _speechSendScheduled = false;
       if (mounted) {
         setState(() {
           _speechError = 'Room no longer available';
@@ -821,7 +829,6 @@ class _TophCallPageState extends State<TophCallPage> {
 
     try {
       await room.sendTextEvent(normalizedText, parseCommands: false);
-      _speechSendScheduled = false;
       setState(() {
         _recognizedText = '';
         _speechStatusLabel = 'Sent ✓';
@@ -833,7 +840,6 @@ class _TophCallPageState extends State<TophCallPage> {
       }
     } catch (_) {
       _sentRecognizedText = null;
-      _speechSendScheduled = false;
       if (mounted) {
         setState(() {
           _speechError = 'Failed to send message';
