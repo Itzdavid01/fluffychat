@@ -64,6 +64,30 @@ bool matchesWakePhrase(String text) {
   return false;
 }
 
+/// Returns `true` when [state] indicates that the app is no longer in the
+/// foreground and audio/listening should be halted immediately.
+///
+/// Halting states:
+/// - [AppLifecycleState.paused]   – screen off / app backgrounded on Android.
+/// - [AppLifecycleState.inactive] – partially obscured (e.g. incoming call
+///                                   overlay) on both platforms.
+/// - [AppLifecycleState.detached] – engine detached; widget is about to be
+///                                   destroyed.
+///
+/// [AppLifecycleState.resumed] returns `false` — the user is back in the app
+/// and can re-initiate interaction themselves.
+bool isHaltingLifecycleState(AppLifecycleState state) {
+  switch (state) {
+    case AppLifecycleState.paused:
+    case AppLifecycleState.inactive:
+    case AppLifecycleState.detached:
+      return true;
+    case AppLifecycleState.resumed:
+    case AppLifecycleState.hidden:
+      return false;
+  }
+}
+
 class TophCallPage extends StatefulWidget {
   final String roomId;
 
@@ -73,7 +97,8 @@ class TophCallPage extends StatefulWidget {
   State<TophCallPage> createState() => _TophCallPageState();
 }
 
-class _TophCallPageState extends State<TophCallPage> {
+class _TophCallPageState extends State<TophCallPage>
+    with WidgetsBindingObserver {
   Timeline? _timeline;
   // Tracks the most recent event ID when the screen opens, so TTS
   // read-aloud can skip old history and only speak new messages.
@@ -130,6 +155,7 @@ class _TophCallPageState extends State<TophCallPage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _tts = FlutterTts();
 
     _tts.setStartHandler(() {
@@ -158,6 +184,7 @@ class _TophCallPageState extends State<TophCallPage> {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     for (final timer in _pendingTtsTimers.values) {
       timer.cancel();
     }
@@ -185,6 +212,60 @@ class _TophCallPageState extends State<TophCallPage> {
     }
     _tts.stop();
     super.dispose();
+  }
+
+  // ---------------------------------------------------------------------------
+  // App lifecycle observer
+  // ---------------------------------------------------------------------------
+
+  /// Called by the Flutter framework whenever the app transitions between
+  /// foreground and background states.
+  ///
+  /// **Halting states** (paused / inactive / detached): all audio and
+  /// listening is stopped so the user does not experience phantom TTS
+  /// playback or runaway microphone use when the app is not in focus.
+  ///
+  /// **Resumed**: the UI is restored to idle — no audio is auto-restarted.
+  /// The [_latestSeenEventId] timeline marker is intentionally left untouched
+  /// so already-spoken history is not replayed on return.
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (isHaltingLifecycleState(state)) {
+      // Stop TTS queue + playback.
+      unawaited(_stopSpeaking());
+
+      // Cancel the active adaptive endpointer (safety-net timer etc.).
+      _endpointer?.cancel();
+      _endpointer = null;
+
+      // Cancel any pending speech-send safety-net timer.
+      _pendingSpeechSendTimer?.cancel();
+      _pendingSpeechSendTimer = null;
+
+      // Stop the background wake-word listen.
+      unawaited(_stopWakeWordListen());
+
+      // Stop a normal command listen if active.
+      if (_isListening) {
+        unawaited(_speech.cancel());
+        if (mounted) {
+          setState(() {
+            _isListening = false;
+            _speechStatusLabel = 'Paused';
+          });
+        }
+      }
+    } else {
+      // AppLifecycleState.resumed — restore idle label; do not auto-resume
+      // audio or listening. _latestSeenEventId is NOT touched.
+      if (mounted) {
+        setState(() {
+          if (_speechStatusLabel == 'Paused') {
+            _speechStatusLabel = 'Tap to speak';
+          }
+        });
+      }
+    }
   }
 
   /// Configures [AudioSession] for hands-free voice use, requests audio focus,
