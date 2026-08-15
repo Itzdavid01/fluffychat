@@ -20,7 +20,7 @@ bool isSpeakableTophBody(String body) {
   final lower = trimmed.toLowerCase();
   final lines = trimmed.split('\n');
 
-  final deniedFragments = <String>[
+  final deniedExactFragments = <String>[
     'tool_calls',
     'function_call',
     'function response',
@@ -29,7 +29,6 @@ bool isSpeakableTophBody(String body) {
     'tool result',
     'tool output',
     'recipient_name',
-    'parameters',
     'functions.',
     'multi_tool_use.',
     'browser_',
@@ -45,7 +44,22 @@ bool isSpeakableTophBody(String body) {
     'cronjob response:',
   ];
 
-  if (deniedFragments.any(lower.contains)) return false;
+  if (deniedExactFragments.any(lower.contains)) return false;
+
+  // Avoid broad natural-language false positives. Words such as
+  // "parameters", "arguments", "function", and "memory" are valid in normal
+  // prose, but tool payloads expose them in structured forms like
+  // `parameters: {...}` or `"arguments": {...}`.
+  final structuredToolPatterns = <RegExp>[
+    RegExp(r'\bparameters\s*[:=]\s*[\[{]', caseSensitive: false),
+    RegExp(r'\barguments\s*[:=]\s*[\[{]', caseSensitive: false),
+    RegExp(r'"parameters"\s*:\s*\{', caseSensitive: false),
+    RegExp(r'"arguments"\s*:\s*\{', caseSensitive: false),
+    RegExp(r'\bname\s*[:=]\s*functions\.', caseSensitive: false),
+  ];
+  if (structuredToolPatterns.any((pattern) => pattern.hasMatch(trimmed))) {
+    return false;
+  }
 
   // Edited tool/status messages often arrive as markdown/code blocks after the
   // original system-ish body was filtered. Do not read code fences or line-by-

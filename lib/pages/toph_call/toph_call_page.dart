@@ -54,7 +54,13 @@ class _TophCallPageState extends State<TophCallPage> {
   final Map<String, Timer> _pendingTtsTimers = {};
   final Map<String, String> _pendingTtsBodies = {};
   final Set<String> _spokenTtsKeys = {};
-  final Set<int> _spokenBodyHashes = {};
+  final Set<String> _spokenBodyTexts = {};
+
+  // Sequential TTS queue so multi-message assistant responses are spoken
+  // one after another without each new event interrupting the prior utterance.
+  final List<String> _ttsQueue = [];
+  bool _ttsQueuePlaying = false;
+
   static const _ttsStabilizationDelay = Duration(milliseconds: 1800);
 
   Room? get _room => Matrix.of(context).client.getRoomById(widget.roomId);
@@ -68,10 +74,17 @@ class _TophCallPageState extends State<TophCallPage> {
       if (mounted) setState(() => _isSpeaking = true);
     });
     _tts.setCompletionHandler(() {
-      if (mounted) setState(() => _isSpeaking = false);
+      if (mounted) {
+        setState(() => _isSpeaking = false);
+        _advanceTtsQueue();
+      }
     });
     _tts.setErrorHandler((_) {
-      if (mounted) setState(() => _isSpeaking = false);
+      if (mounted) {
+        setState(() => _isSpeaking = false);
+        // On error, skip the current utterance and try the next queued item.
+        _advanceTtsQueue();
+      }
     });
 
     _initSpeech();
@@ -86,6 +99,8 @@ class _TophCallPageState extends State<TophCallPage> {
     }
     _pendingTtsTimers.clear();
     _pendingTtsBodies.clear();
+    _ttsQueue.clear();
+    _ttsQueuePlaying = false;
     _pendingSpeechSendTimer?.cancel();
     _pendingSpeechSendTimer = null;
     _timeline?.cancelSubscriptions();
@@ -124,8 +139,19 @@ class _TophCallPageState extends State<TophCallPage> {
     _timeline?.requestKeys(onlineKeyBackupOnly: false);
 
     // Record the latest event ID as seen so we can track new messages later.
+    // Use the newest non-own event as the marker so it stays valid if the
+    // user's own optimistic local echo is later replaced with a different
+    // server-confirmed eventId (which would orphan a marker on an own event).
     if (_timeline != null && _timeline!.events.isNotEmpty) {
-      _latestSeenEventId = _timeline!.events.first.eventId;
+      final ownUserId = matrix.client.userID;
+      for (final event in _timeline!.events) {
+        if (event.senderId != ownUserId) {
+          _latestSeenEventId = event.eventId;
+          break;
+        }
+      }
+      // Fallback: if every event is our own, use the newest anyway.
+      _latestSeenEventId ??= _timeline!.events.first.eventId;
     }
 
     if (mounted) setState(() {});
@@ -135,15 +161,28 @@ class _TophCallPageState extends State<TophCallPage> {
     if (!mounted) return;
     try {
       _speakNewIncoming();
-    } catch (_) {
+    } catch (error, stackTrace) {
       // Timeline updates must still rebuild the message list even if TTS
       // filtering/scheduling hits an unexpected event shape.
+      debugPrint('Toph Call TTS scheduling failed: $error\n$stackTrace');
+    } finally {
+      if (mounted) setState(() {});
     }
-    setState(() {});
   }
 
   /// Inspects the timeline for new text events from other senders and schedules
   /// them for TTS read-aloud after filtering and edit stabilization.
+  ///
+  /// Event-ordering invariant: timeline.events is newest-first. The marker
+  /// [_latestSeenEventId] must always point to an event that will remain
+  /// present in the timeline. Setting the marker to our own event is unsafe
+  /// because the Matrix SDK may replace a local echo's temporary eventId
+  /// with the server-assigned ID, orphaning the marker and causing every
+  /// subsequent [_speakNewIncoming] to re-collect (and re-speak) all history.
+  ///
+  /// Therefore the marker is only advanced to non-own speakable events.
+  /// Own sends are re-scanned on each update (harmless extra work) rather
+  /// than risk a stale marker that replays old assistant messages.
   void _speakNewIncoming() {
     final timeline = _timeline;
     if (timeline == null) return;
@@ -154,14 +193,36 @@ class _TophCallPageState extends State<TophCallPage> {
 
     // Collect events from newest to oldest until we hit the last-seen ID.
     final newEvents = <Event>[];
+    var foundMarker = false;
     for (final event in timeline.events) {
-      if (event.eventId == _latestSeenEventId) break;
+      if (event.eventId == _latestSeenEventId) {
+        foundMarker = true;
+        break;
+      }
       newEvents.add(event);
     }
 
-    // Update the marker to the newest event ID so we don't replay these.
-    if (timeline.events.isNotEmpty) {
+    // Safety net: if the marker event was not found — e.g. because an
+    // optimistic local echo was replaced with a confirmed event carrying a
+    // different eventId, or the marked event was redacted/removed — reset
+    // the marker to the newest event so we don't re-collect the entire
+    // timeline on every future update.
+    //
+    // Stale marker recovery: when the prior marker was orphaned (non-null
+    // but no longer present in the timeline), the loop above collected the
+    // entire timeline into newEvents. We must return immediately after
+    // resetting the marker — otherwise the all-history batch is scheduled
+    // for TTS, which replays old assistant messages once (the exact bug
+    // this recovery path exists to prevent). The next timeline update will
+    // use the freshly-reset marker and collect only genuinely new events.
+    //
+    // This also handles the edge case where _latestSeenEventId is null
+    // (e.g. an update fires during _loadTimeline before the marker is set):
+    // we reset-and-return without speaking, and _loadTimeline later sets
+    // the correct initial marker.
+    if (!foundMarker && timeline.events.isNotEmpty) {
       _latestSeenEventId = timeline.events.first.eventId;
+      return;
     }
 
     if (newEvents.isEmpty) return;
@@ -178,6 +239,15 @@ class _TophCallPageState extends State<TophCallPage> {
         )
         .toList();
 
+    // Advance the marker only to events we actually speak.  newEvents is
+    // newest-first (same order as timeline.events) so toSpeak.first is the
+    // newest speakable event.  When toSpeak is empty (all new events are our
+    // own) the marker is left unchanged so it never lands on an own event
+    // whose eventId could later be replaced by the server.
+    if (toSpeak.isNotEmpty) {
+      _latestSeenEventId = toSpeak.first.eventId;
+    }
+
     // Speak in chronological order (oldest first).
     for (final event in toSpeak.reversed) {
       final body = event.calcLocalizedBodyFallback(
@@ -189,18 +259,21 @@ class _TophCallPageState extends State<TophCallPage> {
     }
   }
 
+  /// Returns `true` when [event] is a raw Matrix replacement/edit event
+  /// (rel_type == 'm.replace'). These events arrive as standalone messages
+  /// but should never be read aloud — the SDK surfaces the updated content
+  /// through the original event's body instead.
   bool _isMatrixReplacementEvent(Event event) {
-    final relatesTo = event.content['m.relates_to'];
-    return relatesTo is Map && relatesTo['rel_type'] == RelationshipTypes.edit;
+    return event.relationshipType == RelationshipTypes.edit;
   }
 
   /// Schedules [event] with [body] for TTS read-aloud after a stabilization
-  /// delay. Cancels any earlier timer for the same event ID. Skips if the
-  /// body is non-speakable, empty after sanitization, or already spoken.
+  /// delay. Cancels any earlier timer for the same event ID. The speakability
+  /// policy is checked after the delay so Matrix edits that settle into a
+  /// human-facing final body are judged by their final text, not an
+  /// intermediate body.
   void _scheduleTtsForEvent(Event event, String body) {
     final eventId = event.eventId;
-
-    if (!isSpeakableTophBody(body)) return;
 
     final sanitized = sanitizeMarkdownForSpeech(body);
     if (sanitized.isEmpty) return;
@@ -218,47 +291,129 @@ class _TophCallPageState extends State<TophCallPage> {
       _pendingTtsTimers.remove(eventId);
       if (latestSanitized == null || latestSanitized.isEmpty) return;
 
+      if (!isSpeakableTophBody(latestSanitized)) return;
+
       final latestKey = '$eventId:${latestSanitized.hashCode}';
       if (_spokenTtsKeys.contains(latestKey)) return;
 
-      // Body-level duplicate suppression.
-      final bodyHash = latestSanitized.hashCode;
-      if (_spokenBodyHashes.contains(bodyHash)) return;
+      // Body-level duplicate suppression. Store exact text, not hashCode, so a
+      // rare hash collision cannot silence a distinct assistant response.
+      if (_spokenBodyTexts.contains(latestSanitized)) return;
 
       // Cap memory growth.
       if (_spokenTtsKeys.length > 200) {
+        debugPrint('Toph Call TTS key cache exceeded 200 entries; clearing.');
         _spokenTtsKeys.clear();
       }
-      if (_spokenBodyHashes.length > 200) {
-        _spokenBodyHashes.clear();
+      if (_spokenBodyTexts.length > 200) {
+        debugPrint('Toph Call TTS body cache exceeded 200 entries; clearing.');
+        _spokenBodyTexts.clear();
       }
 
       _spokenTtsKeys.add(latestKey);
-      _spokenBodyHashes.add(bodyHash);
-      _speak(latestSanitized);
+      _spokenBodyTexts.add(latestSanitized);
+      _enqueueTts(latestSanitized);
     });
   }
 
-  /// Stops current speech and speaks [text] via TTS.
-  Future<void> _speak(String text) async {
-    await _tts.stop();
-    await _tts.speak(text);
+  /// Appends [text] to the TTS queue and starts playback if idle.
+  /// Duplicate suppression is handled by the caller before enqueuing.
+  void _enqueueTts(String text) {
+    if (text.isEmpty) return;
+    _ttsQueue.add(text);
+    if (!_ttsQueuePlaying) {
+      _advanceTtsQueue();
+    }
   }
 
-  /// Stops any ongoing TTS playback.
+  /// Plays the next item from the TTS queue, if any.
+  /// Called automatically by the TTS completion/error handlers.
+  void _advanceTtsQueue() {
+    if (!mounted) return;
+    if (_ttsQueue.isEmpty) {
+      _ttsQueuePlaying = false;
+      return;
+    }
+    _ttsQueuePlaying = true;
+    final next = _ttsQueue.removeAt(0);
+    unawaited(_speakInternal(next));
+  }
+
+  /// Speaks [text] via TTS without stopping any prior utterance.
+  /// This is called only by [_advanceTtsQueue] when the queue is empty,
+  /// so there is never a playing utterance to interrupt.
+  Future<void> _speakInternal(String text) async {
+    try {
+      await _tts.speak(text);
+    } catch (error, stackTrace) {
+      debugPrint('Toph Call TTS speak failed: $error\n$stackTrace');
+      if (mounted) setState(() => _isSpeaking = false);
+      // Advance even on error so the queue does not stall.
+      _advanceTtsQueue();
+    }
+  }
+
+  /// Stops any ongoing TTS playback and clears the pending queue.
   Future<void> _stopSpeaking() async {
+    _ttsQueue.clear();
+    _ttsQueuePlaying = false;
     await _tts.stop();
+  }
+
+  /// Speaks [text] immediately, interrupting any ongoing TTS or queued
+  /// auto-playback. This is the dedicated replay path for tap-to-speak and
+  /// is kept separate from [_speakInternal] / [_advanceTtsQueue] so that
+  /// replay is not affected by queue state, completion-handler timing, or
+  /// platform-level races between stop() and speak().
+  Future<void> _speakNow(String text) async {
+    if (text.isEmpty) return;
+
+    // Stop queued auto-playback from restarting after our interrupt.
+    _ttsQueue.clear();
+    _ttsQueuePlaying = false;
+
+    // Stop any in-progress TTS.  Must be awaited so the engine is quiet
+    // before we start the new utterance.  Wrapped in try/catch because
+    // some platforms throw when stop() is called with nothing playing.
+    try {
+      await _tts.stop();
+    } catch (_) {
+      // Ignore — the engine may not have been speaking.
+    }
+
+    // Yield the microtask queue so any TTS completion/error callbacks
+    // enqueued by stop() can drain before we issue a new speak().
+    // Without this, a stale callback may fire mid-speak and confuse
+    // queue state (though the queue is already empty so the effect is
+    // limited to a spurious _advanceTtsQueue no-op).
+    await Future<void>.delayed(const Duration(milliseconds: 80));
+
+    if (!mounted) return;
+
+    // Speak directly.  Do NOT route through _speakInternal / _advanceTtsQueue
+    // because those are designed for sequential queue playback.  Replay is a
+    // one-shot interrupt and must not risk re-entering the queue machinery.
+    try {
+      await _tts.speak(text);
+    } catch (error, stackTrace) {
+      debugPrint('Toph Call TTS replay failed: $error\n$stackTrace');
+      if (mounted) setState(() => _isSpeaking = false);
+    }
   }
 
   /// Replays a visible chat bubble through the same TTS safety policy used for
   /// incoming messages. Tool/status/system chatter stays silent even if tapped.
+  ///
+  /// Sanitizes markdown BEFORE checking speakability so that code fences and
+  /// other markup don't cause the policy to reject a message that would be
+  /// speakable once the markup is stripped (matching _scheduleTtsForEvent).
   Future<void> _replayMessage(String body) async {
-    if (!isSpeakableTophBody(body)) return;
-
     final sanitized = sanitizeMarkdownForSpeech(body);
     if (sanitized.isEmpty) return;
 
-    await _speak(sanitized);
+    if (!isSpeakableTophBody(sanitized)) return;
+
+    await _speakNow(sanitized);
   }
 
   List<Event> _visibleTextEvents() {
@@ -319,6 +474,11 @@ class _TophCallPageState extends State<TophCallPage> {
             setState(() {
               _speechError = error.errorMsg;
               _speechStatusLabel = 'Error';
+              // Reset listening state on error so the mic button recovers.
+              _isListening = false;
+              _speechSendScheduled = false;
+              _pendingSpeechSendTimer?.cancel();
+              _pendingSpeechSendTimer = null;
             });
           }
         },
@@ -344,33 +504,50 @@ class _TophCallPageState extends State<TophCallPage> {
       _speechError = null;
     });
 
-    await _speech.listen(
-      onResult: (result) {
-        if (mounted) {
-          setState(() {
-            _recognizedText = result.recognizedWords;
-            if (result.finalResult) {
-              _speechStatusLabel = 'Processing...';
+    try {
+      await _speech.listen(
+        onResult: (result) {
+          if (mounted) {
+            setState(() {
+              _recognizedText = result.recognizedWords;
+              if (result.finalResult) {
+                _speechStatusLabel = 'Processing...';
+              }
+            });
+
+            if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
+              _scheduleRecognizedTextSend(result.recognizedWords.trim());
             }
-          });
-
-          if (result.finalResult && result.recognizedWords.trim().isNotEmpty) {
-            _scheduleRecognizedTextSend(result.recognizedWords.trim());
           }
-        }
-      },
-      listenOptions: stt.SpeechListenOptions(
-        listenFor: const Duration(seconds: 60),
-        pauseFor: const Duration(seconds: 5),
-        partialResults: true,
-        cancelOnError: true,
-      ),
-    );
+        },
+        listenOptions: stt.SpeechListenOptions(
+          listenFor: const Duration(seconds: 60),
+          pauseFor: const Duration(seconds: 5),
+          partialResults: true,
+          cancelOnError: true,
+        ),
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Toph Call speech listen failed: $error\n$stackTrace');
+      if (mounted) {
+        setState(() {
+          _isListening = false;
+          _speechError = 'Failed to start listening';
+          _speechStatusLabel = 'Error';
+        });
+      }
+      return;
+    }
 
-    // Do not send here. `listen()` can complete after the final-result
-    // callback has already scheduled a send, which caused duplicate Matrix
-    // messages. Final results are handled by `_scheduleRecognizedTextSend()`;
-    // manual stop is handled by `_stopAndSend()`.
+    // The listen() call may return without error even when the platform
+    // failed to start. Verify that listening actually began.
+    if (mounted && !_speech.isListening) {
+      setState(() {
+        _isListening = false;
+        _speechError = 'Microphone unavailable';
+        _speechStatusLabel = 'Tap to speak';
+      });
+    }
   }
 
   /// Schedule a send after speech recognition emits a final result.
@@ -380,15 +557,19 @@ class _TophCallPageState extends State<TophCallPage> {
   /// app can display recognized words but never submit them unless the user
   /// finds and taps the stop button manually.
   void _scheduleRecognizedTextSend(String text) {
-    if (_speechSendScheduled || _isSending) return;
+    // Always restart the timer with the latest recognized text so that
+    // repeated final results (e.g. long natural pauses between phrases)
+    // don't leave a stale first result scheduled. Only bail out when a
+    // send is already in-flight.
+    if (_isSending) return;
     _speechSendScheduled = true;
 
-    // Give an explicit manual tap a chance to win. Android STT often emits a
-    // final result at the same moment the user presses the visible send button;
-    // deferring the automatic send lets the manual path cancel this timer so
-    // one utterance cannot go out through both paths.
+    // Give natural pauses room before auto-sending. Android STT can emit a
+    // final result while the user is still thinking; a short delay made Toph
+    // Call send before David finished talking. Keep this aligned with the
+    // 5-second pauseFor window so auto-send only fires after a real pause.
     _pendingSpeechSendTimer?.cancel();
-    _pendingSpeechSendTimer = Timer(const Duration(milliseconds: 700), () {
+    _pendingSpeechSendTimer = Timer(const Duration(seconds: 5), () {
       _pendingSpeechSendTimer = null;
       unawaited(_sendScheduledRecognizedText(text));
     });
@@ -403,19 +584,27 @@ class _TophCallPageState extends State<TophCallPage> {
 
     if (!mounted) return;
     await _sendRecognizedText(text);
+    // Timer fired and send completed — clear the flag so future
+    // listen sessions don't start with a stale pending state.
+    _speechSendScheduled = false;
   }
 
   /// Stop listening and send the final recognized text.
   Future<void> _stopAndSend() async {
     if (!_isListening) return;
 
+    // Explicit Stop & Send wins over the delayed automatic final-result send.
+    // Returning early here can lose speech if the delayed timer later fails or
+    // the room becomes unavailable.
+    if (_speechSendScheduled) {
+      _pendingSpeechSendTimer?.cancel();
+      _pendingSpeechSendTimer = null;
+      _speechSendScheduled = false;
+    }
+
     await _speech.stop();
 
     if (!mounted) return;
-
-    if (_speechSendScheduled) {
-      return;
-    }
 
     final text = _recognizedText.trim();
     if (text.isNotEmpty) {
@@ -483,7 +672,18 @@ class _TophCallPageState extends State<TophCallPage> {
     if (_sentRecognizedText == normalizedText) return;
 
     final room = _room;
-    if (room == null) return;
+    if (room == null) {
+      _speechSendScheduled = false;
+      if (mounted) {
+        setState(() {
+          _speechError = 'Room no longer available';
+          _speechStatusLabel = 'Error';
+          _isListening = false;
+          _isSending = false;
+        });
+      }
+      return;
+    }
 
     _sentRecognizedText = normalizedText;
     if (!sendingAlreadyShown) {
@@ -496,6 +696,7 @@ class _TophCallPageState extends State<TophCallPage> {
 
     try {
       await room.sendTextEvent(normalizedText, parseCommands: false);
+      _speechSendScheduled = false;
       setState(() {
         _recognizedText = '';
         _speechStatusLabel = 'Sent ✓';
@@ -701,50 +902,55 @@ class _TophCallPageState extends State<TophCallPage> {
                             child: InkWell(
                               borderRadius: BorderRadius.circular(12),
                               onTap: () => unawaited(_replayMessage(body)),
-                              child: Container(
-                                constraints: BoxConstraints(
-                                  maxWidth:
-                                      MediaQuery.of(context).size.width * 0.78,
-                                ),
-                                padding: const EdgeInsets.symmetric(
-                                  horizontal: 12,
-                                  vertical: 8,
-                                ),
-                                decoration: BoxDecoration(
-                                  color: isOwn
-                                      ? Theme.of(
+                              child: Semantics(
+                                label: 'Replay message from $senderName',
+                                button: true,
+                                child: Container(
+                                  constraints: BoxConstraints(
+                                    maxWidth:
+                                        MediaQuery.of(context).size.width *
+                                            0.78,
+                                  ),
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 12,
+                                    vertical: 8,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: isOwn
+                                        ? Theme.of(
+                                            context,
+                                          ).colorScheme.primaryContainer
+                                        : Theme.of(
+                                            context,
+                                          ).colorScheme.surfaceContainerHighest,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Column(
+                                    crossAxisAlignment: isOwn
+                                        ? CrossAxisAlignment.end
+                                        : CrossAxisAlignment.start,
+                                    children: [
+                                      Text(
+                                        senderName,
+                                        style: Theme.of(context)
+                                            .textTheme
+                                            .labelSmall
+                                            ?.copyWith(
+                                              fontWeight: FontWeight.bold,
+                                              color: Theme.of(
+                                                context,
+                                              ).colorScheme.primary,
+                                            ),
+                                      ),
+                                      const SizedBox(height: 2),
+                                      Text(
+                                        body,
+                                        style: Theme.of(
                                           context,
-                                        ).colorScheme.primaryContainer
-                                      : Theme.of(
-                                          context,
-                                        ).colorScheme.surfaceContainerHighest,
-                                  borderRadius: BorderRadius.circular(12),
-                                ),
-                                child: Column(
-                                  crossAxisAlignment: isOwn
-                                      ? CrossAxisAlignment.end
-                                      : CrossAxisAlignment.start,
-                                  children: [
-                                    Text(
-                                      senderName,
-                                      style: Theme.of(context)
-                                          .textTheme
-                                          .labelSmall
-                                          ?.copyWith(
-                                            fontWeight: FontWeight.bold,
-                                            color: Theme.of(
-                                              context,
-                                            ).colorScheme.primary,
-                                          ),
-                                    ),
-                                    const SizedBox(height: 2),
-                                    Text(
-                                      body,
-                                      style: Theme.of(
-                                        context,
-                                      ).textTheme.bodyMedium,
-                                    ),
-                                  ],
+                                        ).textTheme.bodyMedium,
+                                      ),
+                                    ],
+                                  ),
                                 ),
                               ),
                             ),
