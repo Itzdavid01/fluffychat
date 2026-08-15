@@ -41,6 +41,29 @@ bool shouldBargeIn({
   return isSpeaking && (isListening || hasPartialSpeech);
 }
 
+/// Returns `true` when [text] contains a recognised wake phrase.
+///
+/// Accepted phrases (case-insensitive, trailing punctuation stripped):
+/// - "hey toph" / "hey toph,"
+/// - "ok toph"  / "okay toph"
+///
+/// The check is deliberately kept as a simple substring scan so it works on
+/// continuous partial-result streams without needing word boundaries.
+bool matchesWakePhrase(String text) {
+  // Normalise: lower-case and strip leading/trailing whitespace.
+  final normalised = text.toLowerCase().trim();
+  // Remove trailing punctuation characters that ASR commonly appends.
+  final stripped = normalised.replaceAll(RegExp(r'[.,!?]+$'), '').trim();
+
+  // Accept both the exact phrase and a version without trailing punctuation.
+  for (final candidate in [normalised, stripped]) {
+    if (candidate.contains('hey toph') || candidate.contains('ok toph') || candidate.contains('okay toph')) {
+      return true;
+    }
+  }
+  return false;
+}
+
 class TophCallPage extends StatefulWidget {
   final String roomId;
 
@@ -72,6 +95,13 @@ class _TophCallPageState extends State<TophCallPage> {
   String _recognizedText = '';
   String _speechStatusLabel = 'Tap to speak';
   String? _speechError;
+
+  // Wake-word state — opt-in, defaults to OFF.
+  // When true a low-effort keyword listen runs in the background.
+  bool _wakeWordEnabled = false;
+  // True while the background keyword listen is active.
+  bool _isWakeListening = false;
+
 
   late final FlutterTts _tts;
   bool _isSpeaking = false;
@@ -148,6 +178,11 @@ class _TophCallPageState extends State<TophCallPage> {
     _timeline = null;
     _sendController.dispose();
     _scrollController.dispose();
+    // Stop the keyword listen if active so the mic is released on page exit.
+    if (_isWakeListening) {
+      _isWakeListening = false;
+      unawaited(_speech.cancel());
+    }
     _tts.stop();
     super.dispose();
   }
@@ -704,6 +739,99 @@ class _TophCallPageState extends State<TophCallPage> {
     }
   }
 
+  // ---------------------------------------------------------------------------
+  // Wake-word ("Hey Toph") — optional always-listening keyword mode
+  // ---------------------------------------------------------------------------
+
+  /// Starts a low-effort background keyword listen.
+  ///
+  /// Uses a long [listenFor] window (15 min) with a short [pauseFor] (500 ms)
+  /// so the STT engine continuously streams partial results. Each partial is
+  /// scanned by [matchesWakePhrase]; if found the keyword listen is cancelled
+  /// and a normal command listen is started.
+  ///
+  /// IMPORTANT: results from the keyword listen MUST NOT reach
+  /// [AdaptiveEndpointer] or [_sendRecognizedText]. The [onResult] callback
+  /// below only calls [matchesWakePhrase] and never updates [_recognizedText]
+  /// or feeds [_endpointer].
+  Future<void> _startWakeWordListen() async {
+    if (!_speechAvailable || _isListening || _isWakeListening) return;
+
+    if (mounted) setState(() => _isWakeListening = true);
+
+    try {
+      await _speech.listen(
+        onResult: (result) {
+          // Keyword-scan path — deliberately isolated from normal send path.
+          // Do NOT update _recognizedText or feed _endpointer here.
+          if (!mounted || !_wakeWordEnabled) return;
+
+          final words = result.recognizedWords;
+          if (words.isEmpty) return;
+
+          if (matchesWakePhrase(words)) {
+            // Wake phrase detected — stop keyword listen and acknowledge.
+            _isWakeListening = false;
+            unawaited(_speech.cancel());
+
+            // Brief TTS acknowledgment, then start a normal command listen.
+            // Use a micro-delay so cancel() can settle before speak + listen.
+            Future<void>.delayed(const Duration(milliseconds: 150), () async {
+              if (!mounted || !_wakeWordEnabled) return;
+              // Acknowledge via TTS — short, non-intrusive.
+              await _tts.speak('Yes?');
+              // Small buffer so the TTS engine hands back audio focus before
+              // the STT engine requests it again.
+              await Future<void>.delayed(const Duration(milliseconds: 300));
+              if (!mounted || !_wakeWordEnabled) return;
+              await _startListening();
+            });
+          }
+        },
+        listenOptions: stt.SpeechListenOptions(
+          // Very long window keeps the session alive in the background.
+          listenFor: const Duration(minutes: 15),
+          // Short pauseFor means partial results flow continuously.
+          pauseFor: const Duration(milliseconds: 500),
+          partialResults: true,
+          cancelOnError: true,
+        ),
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Toph Call wake-word listen failed: $error\n$stackTrace');
+      if (mounted) setState(() => _isWakeListening = false);
+    }
+  }
+
+  /// Stops the background keyword listen (no-op when not active).
+  Future<void> _stopWakeWordListen() async {
+    if (!_isWakeListening) return;
+    _isWakeListening = false;
+    try {
+      await _speech.cancel();
+    } catch (error, stackTrace) {
+      debugPrint('Toph Call wake-word stop failed: $error\n$stackTrace');
+    }
+    if (mounted) setState(() {});
+  }
+
+  /// Toggles wake-word mode on or off and updates state.
+  Future<void> _toggleWakeWord({required bool enabled}) async {
+    if (enabled == _wakeWordEnabled) return;
+    setState(() => _wakeWordEnabled = enabled);
+
+    if (enabled) {
+      // Start keyword listen unless a normal command listen is already running.
+      if (!_isListening) {
+        await _startWakeWordListen();
+      }
+    } else {
+      // User turned off wake-word — stop keyword listen and return to idle.
+      await _stopWakeWordListen();
+    }
+  }
+
+
   /// Shared send handler invoked by [AdaptiveEndpointer.onSend] (adaptive
   /// silence endpointing) and by the explicit "Stop & Send" path.
   ///
@@ -898,6 +1026,23 @@ class _TophCallPageState extends State<TophCallPage> {
                     ],
                   ),
                 ),
+                // Wake-word toggle — opt-in, off by default.
+                Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Text(
+                      'Hey Toph',
+                      style: Theme.of(context).textTheme.labelSmall,
+                    ),
+                    Switch(
+                      value: _wakeWordEnabled,
+                      onChanged: _speechAvailable
+                          ? (v) => unawaited(_toggleWakeWord(enabled: v))
+                          : null,
+                      materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                    ),
+                  ],
+                ),
               ],
             ),
           ),
@@ -938,6 +1083,29 @@ class _TophCallPageState extends State<TophCallPage> {
                       ),
                   ],
                 ),
+                // Wake-word active indicator
+                if (_isWakeListening && !_isListening)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Row(
+                      children: [
+                        Icon(
+                          Icons.hearing,
+                          size: 14,
+                          color: Theme.of(context).colorScheme.secondary,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Listening for "Hey Toph"…',
+                          style: Theme.of(context).textTheme.labelSmall
+                              ?.copyWith(
+                                color:
+                                    Theme.of(context).colorScheme.secondary,
+                              ),
+                        ),
+                      ],
+                    ),
+                  ),
                 if (_recognizedText.isNotEmpty)
                   Container(
                     width: double.infinity,
